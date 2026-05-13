@@ -1,0 +1,43 @@
+syntax = "proto3";
+
+package db.v1;
+
+option go_package = "github.com/code-lucasgabriel/raft-replicated-db/internal/pb/db/v1;dbv1";
+
+// DB is the client-facing key/value API. Clients may connect to any node;
+// writes against a follower respond with leader_hint set so the client can
+// retry against the current leader.
+service DB {
+  rpc Get(GetRequest) returns (GetResponse);
+  rpc Put(PutRequest) returns (PutResponse);
+  rpc Delete(DeleteRequest) returns (DeleteResponse);
+}
+
+message GetRequest {
+  string key = 1;
+}
+
+message GetResponse {
+  bytes value = 1;
+  bool found = 2;
+  // Populated when this node served a stale read or could not serve the read.
+  string leader_hint = 3;
+}
+
+message PutRequest {
+  string key = 1;
+  bytes value = 2;
+}
+
+message PutResponse {
+  // Empty when accepted by the leader; set to the leader's node id otherwise.
+  string leader_hint = 1;
+}
+
+message DeleteRequest {
+  string key = 1;
+}
+
+message DeleteResponse {
+  string leader_hint = 1;
+}

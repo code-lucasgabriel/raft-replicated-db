@@ -1,0 +1,36 @@
+version: '3'
+
+# Three-node cluster sharing one static peer list. In a real deployment the
+# nodes would run on separate VMs with fixed IPs; the PEERS env var carries
+# the same membership snapshot to every node.
+
+services:
+  node-1:
+    build: .
+    environment:
+      - NODE_ID=node-1
+      - NODE_PORT=5000
+      - PEERS=node-1=node-1:5000,node-2=node-2:5000,node-3=node-3:5000
+    ports:
+      - "5001:5000"
+    restart: unless-stopped
+
+  node-2:
+    build: .
+    environment:
+      - NODE_ID=node-2
+      - NODE_PORT=5000
+      - PEERS=node-1=node-1:5000,node-2=node-2:5000,node-3=node-3:5000
+    ports:
+      - "5002:5000"
+    restart: unless-stopped
+
+  node-3:
+    build: .
+    environment:
+      - NODE_ID=node-3
+      - NODE_PORT=5000
+      - PEERS=node-1=node-1:5000,node-2=node-2:5000,node-3=node-3:5000
+    ports:
+      - "5003:5000"
+    restart: unless-stopped
