@@ -10,6 +10,7 @@ import (
 
 	"github.com/hashicorp/raft"
 
+	"github.com/code-lucasgabriel/raft-replicated-db/internal/lamport"
 	"github.com/code-lucasgabriel/raft-replicated-db/internal/raftnode"
 	"github.com/code-lucasgabriel/raft-replicated-db/internal/server"
 )
@@ -30,19 +31,25 @@ type Node struct {
 }
 
 func New(cfg Config) (*Node, error) {
+	// One Lamport clock per node, shared by every component that sends or
+	// receives messages: the FSM (Raft log deliveries), the DB service
+	// (client RPCs), and later the mutual-exclusion service (peer RPCs).
+	clock := &lamport.Clock{}
+
 	rn, err := raftnode.New(raftnode.Config{
 		NodeID:    cfg.NodeID,
 		DataDir:   cfg.DataDir,
 		BindAddr:  cfg.BindAddr,
 		Peers:     cfg.Peers,
 		Bootstrap: cfg.Bootstrap,
+		Clock:     clock,
 		LogOutput: os.Stderr,
 	})
 	if err != nil {
 		return nil, err
 	}
 
-	dbSvc := server.NewDBService(rn.Raft, rn.Store)
+	dbSvc := server.NewDBService(cfg.NodeID, rn.Raft, rn.Store, clock)
 	srv, err := server.New(cfg.GRPCPort, dbSvc)
 	if err != nil {
 		_ = rn.Raft.Shutdown().Error()

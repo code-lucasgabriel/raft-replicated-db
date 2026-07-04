@@ -9,6 +9,7 @@ import (
 
 	dbv1 "github.com/code-lucasgabriel/raft-replicated-db/internal/pb/db/v1"
 	"github.com/code-lucasgabriel/raft-replicated-db/internal/fsm"
+	"github.com/code-lucasgabriel/raft-replicated-db/internal/lamport"
 	"github.com/code-lucasgabriel/raft-replicated-db/internal/store"
 )
 
@@ -26,40 +27,51 @@ const applyTimeout = 5 * time.Second
 //
 // Reads (Get) are served directly from the local KV store and may therefore
 // be stale — see linearizability note in architecture.md.
+//
+// Lamport protocol: every handler treats the incoming request as a message
+// receive (clock.Observe) and stamps its response as a send (clock.Tick).
+// Proposed commands carry the timestamp of the propose event, which every
+// replica observes in FSM.Apply.
 type DBService struct {
 	dbv1.UnimplementedDBServer
 
-	raft  *raft.Raft
-	store *store.KV
+	nodeID string
+	raft   *raft.Raft
+	store  *store.KV
+	clock  *lamport.Clock
 }
 
-func NewDBService(r *raft.Raft, s *store.KV) *DBService {
-	return &DBService{raft: r, store: s}
+func NewDBService(nodeID string, r *raft.Raft, s *store.KV, c *lamport.Clock) *DBService {
+	return &DBService{nodeID: nodeID, raft: r, store: s, clock: c}
 }
 
 func (s *DBService) Get(_ context.Context, req *dbv1.GetRequest) (*dbv1.GetResponse, error) {
+	s.clock.Observe(req.GetLamportTime())
 	v, ok := s.store.Get(req.GetKey())
 	return &dbv1.GetResponse{
-		Value:      v,
-		Found:      ok,
-		LeaderHint: s.leaderHint(), // empty when we are the leader
+		Value:       v,
+		Found:       ok,
+		LeaderHint:  s.leaderHint(), // empty when we are the leader
+		LamportTime: s.clock.Tick(),
 	}, nil
 }
 
 func (s *DBService) Put(_ context.Context, req *dbv1.PutRequest) (*dbv1.PutResponse, error) {
+	s.clock.Observe(req.GetLamportTime())
 	hint, err := s.propose(fsm.Command{Op: "put", Key: req.GetKey(), Value: req.GetValue()})
 	if err != nil {
 		return nil, err
 	}
-	return &dbv1.PutResponse{LeaderHint: hint}, nil
+	return &dbv1.PutResponse{LeaderHint: hint, LamportTime: s.clock.Tick()}, nil
 }
 
 func (s *DBService) Delete(_ context.Context, req *dbv1.DeleteRequest) (*dbv1.DeleteResponse, error) {
+	s.clock.Observe(req.GetLamportTime())
 	hint, err := s.propose(fsm.Command{Op: "delete", Key: req.GetKey()})
 	if err != nil {
 		return nil, err
 	}
-	return &dbv1.DeleteResponse{LeaderHint: hint}, nil
+	return &dbv1.DeleteResponse{LeaderHint: hint, LamportTime: s.clock.Tick()}, nil
 }
 
 // propose runs a command through Raft. Returns ("", nil) on success;
@@ -69,6 +81,10 @@ func (s *DBService) propose(cmd fsm.Command) (string, error) {
 	if s.raft.State() != raft.Leader {
 		return s.leaderHint(), nil
 	}
+	// Stamp the propose event. Handing the entry to Raft is the "send" of a
+	// message that every replica receives in FSM.Apply.
+	cmd.Time = s.clock.Tick()
+	cmd.Origin = s.nodeID
 	data, err := fsm.Encode(cmd)
 	if err != nil {
 		return "", err

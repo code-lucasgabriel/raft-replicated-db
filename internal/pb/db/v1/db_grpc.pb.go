@@ -30,7 +30,12 @@ const (
 //
 // DB is the client-facing key/value API. Clients may connect to any node;
 // writes against a follower respond with leader_hint set so the client can
-// retry against the current leader (also discoverable via etcd).
+// retry against the current leader.
+//
+// Every request and response carries a Lamport timestamp. A node treats an
+// incoming request as a message receive (clock.Observe) and stamps the
+// response on send (clock.Tick), so causality flows client -> node -> client
+// and, through the Raft log, node -> node.
 type DBClient interface {
 	Get(ctx context.Context, in *GetRequest, opts ...grpc.CallOption) (*GetResponse, error)
 	Put(ctx context.Context, in *PutRequest, opts ...grpc.CallOption) (*PutResponse, error)
@@ -81,7 +86,12 @@ func (c *dBClient) Delete(ctx context.Context, in *DeleteRequest, opts ...grpc.C
 //
 // DB is the client-facing key/value API. Clients may connect to any node;
 // writes against a follower respond with leader_hint set so the client can
-// retry against the current leader (also discoverable via etcd).
+// retry against the current leader.
+//
+// Every request and response carries a Lamport timestamp. A node treats an
+// incoming request as a message receive (clock.Observe) and stamps the
+// response on send (clock.Tick), so causality flows client -> node -> client
+// and, through the Raft log, node -> node.
 type DBServer interface {
 	Get(context.Context, *GetRequest) (*GetResponse, error)
 	Put(context.Context, *PutRequest) (*PutResponse, error)

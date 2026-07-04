@@ -22,6 +22,7 @@ import (
 	raftboltdb "github.com/hashicorp/raft-boltdb/v2"
 
 	"github.com/code-lucasgabriel/raft-replicated-db/internal/fsm"
+	"github.com/code-lucasgabriel/raft-replicated-db/internal/lamport"
 	"github.com/code-lucasgabriel/raft-replicated-db/internal/store"
 )
 
@@ -33,12 +34,13 @@ type Peer struct {
 
 // Config controls how the Raft node is built.
 type Config struct {
-	NodeID    string    // must appear in Peers
-	DataDir   string    // BoltDB files + snapshots live under here
-	BindAddr  string    // local Raft TCP listen address, "host:port"
-	Peers     []Peer    // full cluster membership, including self
-	Bootstrap bool      // first node, first boot only — writes the initial Configuration to the log
-	LogOutput io.Writer // hashicorp/raft and bolt logs go here; nil = stderr
+	NodeID    string         // must appear in Peers
+	DataDir   string         // BoltDB files + snapshots live under here
+	BindAddr  string         // local Raft TCP listen address, "host:port"
+	Peers     []Peer         // full cluster membership, including self
+	Bootstrap bool           // first node, first boot only — writes the initial Configuration to the log
+	Clock     *lamport.Clock // node-wide Lamport clock, observed by the FSM on every apply
+	LogOutput io.Writer      // hashicorp/raft and bolt logs go here; nil = stderr
 }
 
 // Node bundles the raft.Raft handle with the FSM + store it operates on.
@@ -62,6 +64,9 @@ func New(cfg Config) (*Node, error) {
 	if cfg.BindAddr == "" {
 		return nil, fmt.Errorf("raftnode: BindAddr required")
 	}
+	if cfg.Clock == nil {
+		return nil, fmt.Errorf("raftnode: Clock required")
+	}
 	if err := os.MkdirAll(cfg.DataDir, 0o755); err != nil {
 		return nil, fmt.Errorf("raftnode: mkdir DataDir: %w", err)
 	}
@@ -71,7 +76,7 @@ func New(cfg Config) (*Node, error) {
 	}
 
 	s := store.New()
-	f := fsm.New(s)
+	f := fsm.New(s, cfg.Clock)
 
 	rcfg := raft.DefaultConfig()
 	rcfg.LocalID = raft.ServerID(cfg.NodeID)

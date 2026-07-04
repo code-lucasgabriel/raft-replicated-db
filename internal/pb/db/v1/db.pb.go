@@ -24,6 +24,7 @@ const (
 type GetRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Key           string                 `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
+	LamportTime   uint64                 `protobuf:"varint,2,opt,name=lamport_time,json=lamportTime,proto3" json:"lamport_time,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -65,12 +66,20 @@ func (x *GetRequest) GetKey() string {
 	return ""
 }
 
+func (x *GetRequest) GetLamportTime() uint64 {
+	if x != nil {
+		return x.LamportTime
+	}
+	return 0
+}
+
 type GetResponse struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	Value []byte                 `protobuf:"bytes,1,opt,name=value,proto3" json:"value,omitempty"`
 	Found bool                   `protobuf:"varint,2,opt,name=found,proto3" json:"found,omitempty"`
 	// Populated when this node served a stale read or could not serve the read.
 	LeaderHint    string `protobuf:"bytes,3,opt,name=leader_hint,json=leaderHint,proto3" json:"leader_hint,omitempty"`
+	LamportTime   uint64 `protobuf:"varint,4,opt,name=lamport_time,json=lamportTime,proto3" json:"lamport_time,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -126,10 +135,18 @@ func (x *GetResponse) GetLeaderHint() string {
 	return ""
 }
 
+func (x *GetResponse) GetLamportTime() uint64 {
+	if x != nil {
+		return x.LamportTime
+	}
+	return 0
+}
+
 type PutRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Key           string                 `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
 	Value         []byte                 `protobuf:"bytes,2,opt,name=value,proto3" json:"value,omitempty"`
+	LamportTime   uint64                 `protobuf:"varint,3,opt,name=lamport_time,json=lamportTime,proto3" json:"lamport_time,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -178,10 +195,18 @@ func (x *PutRequest) GetValue() []byte {
 	return nil
 }
 
+func (x *PutRequest) GetLamportTime() uint64 {
+	if x != nil {
+		return x.LamportTime
+	}
+	return 0
+}
+
 type PutResponse struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Empty when accepted by the leader; set to the leader's node id otherwise.
 	LeaderHint    string `protobuf:"bytes,1,opt,name=leader_hint,json=leaderHint,proto3" json:"leader_hint,omitempty"`
+	LamportTime   uint64 `protobuf:"varint,2,opt,name=lamport_time,json=lamportTime,proto3" json:"lamport_time,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -223,9 +248,17 @@ func (x *PutResponse) GetLeaderHint() string {
 	return ""
 }
 
+func (x *PutResponse) GetLamportTime() uint64 {
+	if x != nil {
+		return x.LamportTime
+	}
+	return 0
+}
+
 type DeleteRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Key           string                 `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
+	LamportTime   uint64                 `protobuf:"varint,2,opt,name=lamport_time,json=lamportTime,proto3" json:"lamport_time,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -267,9 +300,17 @@ func (x *DeleteRequest) GetKey() string {
 	return ""
 }
 
+func (x *DeleteRequest) GetLamportTime() uint64 {
+	if x != nil {
+		return x.LamportTime
+	}
+	return 0
+}
+
 type DeleteResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	LeaderHint    string                 `protobuf:"bytes,1,opt,name=leader_hint,json=leaderHint,proto3" json:"leader_hint,omitempty"`
+	LamportTime   uint64                 `protobuf:"varint,2,opt,name=lamport_time,json=lamportTime,proto3" json:"lamport_time,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -311,31 +352,44 @@ func (x *DeleteResponse) GetLeaderHint() string {
 	return ""
 }
 
+func (x *DeleteResponse) GetLamportTime() uint64 {
+	if x != nil {
+		return x.LamportTime
+	}
+	return 0
+}
+
 var File_db_v1_db_proto protoreflect.FileDescriptor
 
 const file_db_v1_db_proto_rawDesc = "" +
 	"\n" +
-	"\x0edb/v1/db.proto\x12\x05db.v1\"\x1e\n" +
+	"\x0edb/v1/db.proto\x12\x05db.v1\"A\n" +
 	"\n" +
 	"GetRequest\x12\x10\n" +
-	"\x03key\x18\x01 \x01(\tR\x03key\"Z\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12!\n" +
+	"\flamport_time\x18\x02 \x01(\x04R\vlamportTime\"}\n" +
 	"\vGetResponse\x12\x14\n" +
 	"\x05value\x18\x01 \x01(\fR\x05value\x12\x14\n" +
 	"\x05found\x18\x02 \x01(\bR\x05found\x12\x1f\n" +
 	"\vleader_hint\x18\x03 \x01(\tR\n" +
-	"leaderHint\"4\n" +
+	"leaderHint\x12!\n" +
+	"\flamport_time\x18\x04 \x01(\x04R\vlamportTime\"W\n" +
 	"\n" +
 	"PutRequest\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\fR\x05value\".\n" +
+	"\x05value\x18\x02 \x01(\fR\x05value\x12!\n" +
+	"\flamport_time\x18\x03 \x01(\x04R\vlamportTime\"Q\n" +
 	"\vPutResponse\x12\x1f\n" +
 	"\vleader_hint\x18\x01 \x01(\tR\n" +
-	"leaderHint\"!\n" +
+	"leaderHint\x12!\n" +
+	"\flamport_time\x18\x02 \x01(\x04R\vlamportTime\"D\n" +
 	"\rDeleteRequest\x12\x10\n" +
-	"\x03key\x18\x01 \x01(\tR\x03key\"1\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12!\n" +
+	"\flamport_time\x18\x02 \x01(\x04R\vlamportTime\"T\n" +
 	"\x0eDeleteResponse\x12\x1f\n" +
 	"\vleader_hint\x18\x01 \x01(\tR\n" +
-	"leaderHint2\x97\x01\n" +
+	"leaderHint\x12!\n" +
+	"\flamport_time\x18\x02 \x01(\x04R\vlamportTime2\x97\x01\n" +
 	"\x02DB\x12,\n" +
 	"\x03Get\x12\x11.db.v1.GetRequest\x1a\x12.db.v1.GetResponse\x12,\n" +
 	"\x03Put\x12\x11.db.v1.PutRequest\x1a\x12.db.v1.PutResponse\x125\n" +

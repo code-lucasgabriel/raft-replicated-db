@@ -7,9 +7,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	stdlog "log"
 
 	"github.com/hashicorp/raft"
 
+	"github.com/code-lucasgabriel/raft-replicated-db/internal/lamport"
 	"github.com/code-lucasgabriel/raft-replicated-db/internal/store"
 )
 
@@ -17,11 +19,18 @@ import (
 // leader serialises one of these and passes it to raft.Apply; every node
 // (including the leader) decodes and applies via FSM.Apply.
 //
+// Time and Origin stamp the command with the proposing node's Lamport clock:
+// a committed log entry is, causally, a message from the leader to every
+// replica, so FSM.Apply observes Time on each node. This is how follower
+// clocks advance past write events they didn't originate.
+//
 // JSON is used for KISS — switching to protobuf later is mechanical.
 type Command struct {
-	Op    string `json:"op"`              // "put" | "delete"
-	Key   string `json:"key"`
-	Value []byte `json:"value,omitempty"` // omitted for delete
+	Op     string `json:"op"`              // "put" | "delete"
+	Key    string `json:"key"`
+	Value  []byte `json:"value,omitempty"` // omitted for delete
+	Time   uint64 `json:"time"`            // proposer's Lamport timestamp at propose
+	Origin string `json:"origin"`          // proposing node id
 }
 
 // Encode marshals a Command into the bytes Raft replicates.
@@ -33,18 +42,25 @@ func Encode(c Command) ([]byte, error) { return json.Marshal(c) }
 // quorum commits a log entry; Snapshot/Restore drive log compaction.
 type FSM struct {
 	store *store.KV
+	clock *lamport.Clock
 }
 
-func New(s *store.KV) *FSM { return &FSM{store: s} }
+func New(s *store.KV, c *lamport.Clock) *FSM { return &FSM{store: s, clock: c} }
 
 // Apply runs on each node after a log entry is committed. The return value
 // is forwarded to the caller of raft.Apply on the leader (we return nil on
 // success or an error describing the malformed entry).
+//
+// Observing cmd.Time is a node-local side effect, not FSM state: the clock
+// is not snapshotted and does not influence what the store contains, so
+// determinism of the replicated state is preserved. Re-observing old
+// timestamps during log replay is harmless (Observe is a max).
 func (f *FSM) Apply(log *raft.Log) any {
 	var cmd Command
 	if err := json.Unmarshal(log.Data, &cmd); err != nil {
 		return fmt.Errorf("fsm: malformed command at index %d: %w", log.Index, err)
 	}
+	local := f.clock.Observe(cmd.Time)
 	switch cmd.Op {
 	case "put":
 		f.store.Put(cmd.Key, cmd.Value)
@@ -53,6 +69,8 @@ func (f *FSM) Apply(log *raft.Log) any {
 	default:
 		return fmt.Errorf("fsm: unknown op %q at index %d", cmd.Op, log.Index)
 	}
+	stdlog.Printf("fsm: applied %s %q idx=%d lamport{origin=%s sent=%d local=%d}",
+		cmd.Op, cmd.Key, log.Index, cmd.Origin, cmd.Time, local)
 	return nil
 }
 

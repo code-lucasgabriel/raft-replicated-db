@@ -7,6 +7,11 @@ option go_package = "github.com/code-lucasgabriel/raft-replicated-db/internal/pb
 // DB is the client-facing key/value API. Clients may connect to any node;
 // writes against a follower respond with leader_hint set so the client can
 // retry against the current leader.
+//
+// Every request and response carries a Lamport timestamp. A node treats an
+// incoming request as a message receive (clock.Observe) and stamps the
+// response on send (clock.Tick), so causality flows client -> node -> client
+// and, through the Raft log, node -> node.
 service DB {
   rpc Get(GetRequest) returns (GetResponse);
   rpc Put(PutRequest) returns (PutResponse);
@@ -15,6 +20,7 @@ service DB {
 
 message GetRequest {
   string key = 1;
+  uint64 lamport_time = 2;
 }
 
 message GetResponse {
@@ -22,22 +28,27 @@ message GetResponse {
   bool found = 2;
   // Populated when this node served a stale read or could not serve the read.
   string leader_hint = 3;
+  uint64 lamport_time = 4;
 }
 
 message PutRequest {
   string key = 1;
   bytes value = 2;
+  uint64 lamport_time = 3;
 }
 
 message PutResponse {
   // Empty when accepted by the leader; set to the leader's node id otherwise.
   string leader_hint = 1;
+  uint64 lamport_time = 2;
 }
 
 message DeleteRequest {
   string key = 1;
+  uint64 lamport_time = 2;
 }
 
 message DeleteResponse {
   string leader_hint = 1;
+  uint64 lamport_time = 2;
 }
