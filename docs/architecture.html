@@ -1,0 +1,280 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>raft-replicated-db &mdash; architecture</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<main>
+
+<header class="doc-header">
+  <h1>raft-replicated-db &mdash; architecture</h1>
+  <p class="subtitle">A 3-node, static-membership KV store backed by <code>hashicorp/raft</code>. Component layout, data flow, persistence, failure modes, and the choices worth pushing on.</p>
+</header>
+
+<nav class="toc">
+<ol>
+  <li><a href="#scope">Scope</a></li>
+  <li><a href="#topology">Topology</a></li>
+  <li><a href="#components">Component map</a></li>
+  <li><a href="#write-path">The write path</a></li>
+  <li><a href="#read-path">The read path</a></li>
+  <li><a href="#persistence">Persistence</a></li>
+  <li><a href="#bootstrap">Bootstrap and membership</a></li>
+  <li><a href="#failures">Failure modes</a></li>
+  <li><a href="#fsm">State machine semantics</a></li>
+  <li><a href="#process">Process layout</a></li>
+  <li><a href="#choices">Choices worth pushing on</a></li>
+  <li><a href="#refs">References</a></li>
+</ol>
+</nav>
+
+<h2 id="scope">1. Scope</h2>
+<ul>
+  <li><strong>What it is:</strong> a 3-node, static-membership KV store. Clients speak gRPC. Writes go through Raft; reads are local.</li>
+  <li><strong>What it isn't:</strong> sharded, dynamically-membership'd, multi-region, secure-on-the-wire, observability-rich. Each is a deliberate non-goal for the learning version; this doc flags where each would land.</li>
+</ul>
+
+<h2 id="topology">2. Topology</h2>
+<p>Three nodes, identical binary, two listen ports each. No external coordinator (etcd / Consul / ZK). Membership comes from the <code>PEERS</code> env var baked at boot.</p>
+
+<pre><code>                  ┌───────────────────────┐         ┌───────────────────────┐
+   client ─gRPC─▶ │ node-1                │ ─raft─▶ │ node-2                │
+                  │  :5000  DBService     │         │  :5000  DBService     │
+                  │  :7000  raft TCP      │ ◀─raft─ │  :7000  raft TCP      │
+                  │  /var/lib/raft-db     │         │  /var/lib/raft-db     │
+                  └─────────┬─────────────┘         └───────────┬───────────┘
+                            │ raft (AppendEntries, RequestVote, InstallSnapshot)
+                            ▼
+                  ┌───────────────────────┐
+                  │ node-3                │
+                  │  :5000  DBService     │
+                  │  :7000  raft TCP      │
+                  │  /var/lib/raft-db     │
+                  └───────────────────────┘</code></pre>
+
+<p>Two ports per node, <strong>separate transports</strong>:</p>
+
+<table>
+  <thead>
+    <tr><th>Port</th><th>Protocol</th><th>Carries</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>5000</td><td>gRPC (HTTP/2)</td><td>client DB API (<code>Get</code>, <code>Put</code>, <code>Delete</code>)</td></tr>
+    <tr><td>7000</td><td>hashicorp/raft TCP</td><td><code>RequestVote</code>, <code>AppendEntries</code>, <code>InstallSnapshot</code> between peers</td></tr>
+  </tbody>
+</table>
+
+<div class="callout aside">
+<span class="label">Aside &mdash; why two ports</span>
+<p>The single-port-via-gRPC alternative (<a href="https://github.com/Jille/raft-grpc-transport">Jille/raft-grpc-transport</a>) was considered and rejected: it adds a third-party dep and re-encodes hashicorp/raft's internal messages without changing semantics. Two ports is one extra line of docker-compose and zero extra deps.</p>
+</div>
+
+<h2 id="components">3. Component map</h2>
+
+<pre><code>cmd/main/                  process entrypoint; env-var parsing
+internal/
+  node/                    composition root: builds raftnode + server, drives lifecycle
+  raftnode/                hashicorp/raft wiring: stores, transport, bootstrap, log output
+  fsm/                     raft.FSM: decodes Commands, mutates the store, snapshot/restore
+  store/                   in-memory map[string][]byte with RWMutex; Snapshot/Restore as JSON
+  server/                  client gRPC server; DB service that routes writes through raft.Apply
+  pb/db/v1/                generated protobuf bindings
+proto/db/v1/db.proto       client API schema</code></pre>
+
+<p>Dependency direction (anything left depends on what's to its right):</p>
+
+<pre><code>cmd ─▶ node ─▶ {server, raftnode}
+         └─▶ raftnode ─▶ {fsm, store, hashicorp/raft, raft-boltdb}
+         └─▶ server   ─▶ {hashicorp/raft, fsm, store}</code></pre>
+
+<p><code>server</code> and <code>raftnode</code> are siblings &mdash; they don't know about each other. <code>node</code> is the only package that wires them together. This is what lets you swap the gRPC layer (REST, JSON-RPC, anything) without touching the consensus layer, and vice versa.</p>
+
+<h2 id="write-path">4. The write path</h2>
+
+<p>A <code>Put(k, v)</code> from a client:</p>
+
+<pre><code>1.  Client gRPC ──▶  node-X DBService.Put
+2.  if node-X is NOT leader:
+        return PutResponse{LeaderHint: &lt;leader id&gt;}      ← client retries on hinted node
+3.  cmd = Command{Op:"put", Key:k, Value:v}
+    data = json.Marshal(cmd)
+4.  future = raft.Apply(data, 5s)
+5.  hashicorp/raft on the leader:
+        append entry to local log (BoltDB)
+        broadcast AppendEntries to followers
+        wait until majority of followers ack the entry
+        advance commitIndex past the entry
+        invoke FSM.Apply(entry) on every node (including self)
+6.  FSM.Apply:
+        json.Unmarshal(entry.Data, &amp;cmd)
+        store.Put(cmd.Key, cmd.Value)
+7.  future.Error() returns nil  ──▶  DBService returns PutResponse{}</code></pre>
+
+<p>Key invariants enforced by this path:</p>
+<ul>
+  <li><strong>At most one in-flight commit per entry.</strong> The leader pipelines AppendEntries, but each entry has a single commit point: the index at which a majority has acknowledged.</li>
+  <li><strong>FSM.Apply runs in log order on every node.</strong> hashicorp/raft serialises FSM dispatch; the FSM does not need locks of its own beyond what the underlying store provides.</li>
+  <li><strong>Acknowledgement-after-apply, not after-commit.</strong> The leader returns success only after its own FSM has applied the entry, so the leader's read-after-write is consistent for that client. Other replicas may still be slightly behind.</li>
+</ul>
+
+<p><code>Delete(k)</code> is identical with <code>Op:"delete"</code>.</p>
+
+<h2 id="read-path">5. The read path</h2>
+
+<p><code>Get(k)</code> reads from the local node's <code>store.KV</code> directly, without going through Raft.</p>
+
+<pre><code>1.  Client gRPC ──▶  node-X DBService.Get
+2.  v, ok = store.Get(key)
+3.  return GetResponse{Value: v, Found: ok, LeaderHint: &lt;leader id if not self&gt;}</code></pre>
+
+<p>This is <strong>fast</strong> (no quorum round-trip) and <strong>potentially stale</strong> (follower may be a few entries behind the leader). The <code>LeaderHint</code> is populated when the local node is not the leader, so a client that needs linearizability can retry on the leader.</p>
+
+<div class="callout note">
+<span class="label">Note &mdash; linearizable reads</span>
+<p>A linearizable read on the leader is still not strictly linearizable in hashicorp/raft without <code>VerifyLeader</code> &mdash; the leader could be deposed without knowing it yet. The proper construction is <strong>ReadIndex</strong> (Raft paper &sect;8): on a <code>Get</code>, the leader confirms it's still leader via a quorum heartbeat, then serves the read from its state machine once <code>lastApplied &ge; readIndex</code>. hashicorp/raft exposes <code>VerifyLeader()</code> for the first half; the rest is straightforward. Not implemented here.</p>
+</div>
+
+<h2 id="persistence">6. Persistence</h2>
+
+<p>Each node owns a directory (<code>DATA_DIR=/var/lib/raft-db</code> in containers, mounted as a named volume). hashicorp/raft writes three things to it:</p>
+
+<pre><code>/var/lib/raft-db/
+  raft-log.db            ← BoltDB: replicated log entries (LogStore)
+  raft-stable.db         ← BoltDB: currentTerm, votedFor (StableStore)
+  snapshots/             ← FileSnapshotStore: periodic FSM snapshots + metadata
+    1-5-1700000000000-meta.json
+    1-5-1700000000000-state.bin
+    ...</code></pre>
+
+<p><strong>LogStore</strong> holds every replicated entry from index 1 onward, until log compaction trims earlier entries. Loss of <code>raft-log.db</code> on a node = that node has to re-receive the log from the leader (via AppendEntries with a low <code>prevLogIndex</code>, or via <code>InstallSnapshot</code> if the leader has already compacted past it).</p>
+
+<p><strong>StableStore</strong> holds the small handful of fields Raft must persist synchronously on every term change or vote. Critical for safety: losing <code>currentTerm</code> and <code>votedFor</code> violates Raft's single-vote-per-term guarantee on restart. BoltDB's <code>Sync: true</code> on these writes is what we trust.</p>
+
+<p><strong>SnapshotStore</strong> holds FSM snapshots. hashicorp/raft triggers a snapshot when the log grows past <code>SnapshotThreshold</code> entries (default 8192) and the interval since the last one exceeds <code>SnapshotInterval</code> (default 2 minutes). After a successful snapshot, the prefix of the log up to the snapshot's <code>lastIncludedIndex</code> is truncated.</p>
+
+<p>A follower so far behind that the leader has already compacted past it receives an <code>InstallSnapshot</code> RPC, restores the FSM, and then resumes normal AppendEntries from the post-snapshot index.</p>
+
+<h2 id="bootstrap">7. Bootstrap and membership</h2>
+
+<p>The first time the cluster runs against virgin volumes, <strong>exactly one node</strong> (<code>BOOTSTRAP=true</code> &mdash; node-1 in docker-compose) calls <code>raft.BootstrapCluster</code> with the full peer list. This writes a single <code>Configuration</code> entry to that node's log; the entry then replicates to the other two nodes via AppendEntries. They start as followers, see the leader, and from that moment the cluster is up.</p>
+
+<p>On any subsequent boot &mdash; including node-1 with <code>BOOTSTRAP=true</code> still set &mdash; <code>raft.HasExistingState</code> short-circuits the bootstrap: state already exists in BoltDB, so the library refuses to re-bootstrap and we skip.</p>
+
+<p>This codebase has <strong>no dynamic membership</strong>. <code>raft.AddVoter</code> / <code>raft.RemoveVoter</code> are not exposed. The expectation is that the <code>PEERS</code> list does not change at runtime; if you need to add a node, you'd either:</p>
+<ol>
+  <li>Add an <code>AdminService</code> gRPC with <code>AddVoter</code> / <code>RemoveVoter</code> (proper way), or</li>
+  <li>Stop the cluster, run <code>raft.RecoverCluster</code> with the new peer set, restart (disaster-recovery path).</li>
+</ol>
+<p>Both are deferred. The static-VM assumption is the project's design constraint.</p>
+
+<h2 id="failures">8. Failure modes</h2>
+
+<table>
+  <thead>
+    <tr><th>Failure</th><th>Effect</th><th>Recovery</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Single follower down</td>
+      <td>Quorum (2/3) still met. Leader continues; follower's log gaps when it returns.</td>
+      <td>Follower restarts, leader replays AppendEntries from its <code>nextIndex</code> until caught up.</td>
+    </tr>
+    <tr>
+      <td>Leader down</td>
+      <td>No writes accepted (<code>raft.Apply</code> returns <code>ErrLeadershipLost</code> or times out).</td>
+      <td>Surviving majority holds an election; new leader emerges in ~150-300ms (hashicorp/raft default).</td>
+    </tr>
+    <tr>
+      <td>Network partition (2:1)</td>
+      <td>Majority side keeps committing. Minority side cannot elect a leader, returns hints.</td>
+      <td>Heals automatically when the partition resolves; minority side catches up via AppendEntries / InstallSnap.</td>
+    </tr>
+    <tr>
+      <td>Network partition (1:1:1)</td>
+      <td>No majority. No writes commit. Reads still served (stale).</td>
+      <td>One pair must re-join before progress resumes.</td>
+    </tr>
+    <tr>
+      <td>Total outage, BoltDB intact</td>
+      <td>Cluster restarts; each node reads <code>raft-log.db</code> + <code>raft-stable.db</code> from disk.</td>
+      <td>Election happens, log replays into the FSM, service resumes from <code>lastApplied</code>.</td>
+    </tr>
+    <tr>
+      <td>Total outage, BoltDB corrupt</td>
+      <td>Bootstrap won't help (state exists or is partially written).</td>
+      <td><code>raft.RecoverCluster</code> with a hand-written <code>peers.json</code> is the documented disaster path. Out of scope here.</td>
+    </tr>
+    <tr>
+      <td>Single node BoltDB lost (volume nuked)</td>
+      <td>That node looks brand-new to itself but is still a voter in the live config.</td>
+      <td>On boot the live leader sends a snapshot + AppendEntries; node catches up. No bootstrap needed.</td>
+    </tr>
+  </tbody>
+</table>
+
+<div class="callout note">
+<span class="label">Gotcha &mdash; volume loss vs bootstrap</span>
+<p>The "single node volume nuked" case is the one most people get wrong on a first build: don't try to re-bootstrap. Just bring the node back with the same <code>NODE_ID</code> and empty <code>DATA_DIR</code>; the leader will repair it.</p>
+</div>
+
+<h2 id="fsm">9. State machine semantics</h2>
+
+<p>The FSM is intentionally trivial &mdash; a <code>map[string][]byte</code>. The interesting properties come from how it's driven:</p>
+<ul>
+  <li><strong>Deterministic.</strong> <code>Apply</code> only reads the entry; no clocks, no randomness, no I/O. Two replicas applying the same log starting from the same snapshot will reach byte-identical states.</li>
+  <li><strong>Idempotent at the command level.</strong> A <code>Put k=v</code> applied twice is still <code>k=v</code>; a <code>Delete k</code> after a previous <code>Delete k</code> is a no-op. The Raft log itself never duplicates entries, but command-level idempotence matters for client retries after a leader-hint redirect.</li>
+  <li><strong>No transactions, no compare-and-swap.</strong> The wire format (<code>Command</code>) has only <code>put</code> and <code>delete</code>. Adding <code>cas { key, expected, new }</code> is a one-field extension to <code>Command</code> and ~10 lines in <code>FSM.Apply</code>. The architecture supports it; the schema doesn't yet.</li>
+</ul>
+
+<p>The choice of JSON for the <code>Command</code> encoding is a KISS call: legible in logs, no codegen, easy to extend. Switching to protobuf is mechanical and would buy ~20% smaller log entries.</p>
+
+<h2 id="process">10. Process layout</h2>
+
+<p>A single binary (<code>cmd/main</code>) runs per node. Inside the binary:</p>
+
+<pre><code>main goroutine
+  └─ node.Run
+       ├─ goroutine: gRPC server (server.Server.Serve)
+       └─ goroutine: leader-change logger (polls raft.State / raft.LeaderWithID every 500ms)
+
+hashicorp/raft (internal, library-owned)
+  ├─ FSM dispatch goroutine
+  ├─ leader loop (when leader)
+  ├─ follower loop (when follower)
+  ├─ candidate loop (during elections)
+  ├─ snapshot loop
+  └─ TCP transport accept + per-peer goroutines</code></pre>
+
+<p>Shutdown is straightforward: on <code>SIGINT</code>/<code>SIGTERM</code>, <code>cmd/main</code> cancels the root context. <code>node.Run</code> calls <code>server.GracefulStop</code> (draining in-flight gRPC), then <code>raft.Raft.Shutdown</code> (closing the transport, flushing BoltDB, releasing locks). The transport's TCP listener and the gRPC listener are both closed by these calls.</p>
+
+<h2 id="choices">11. Choices worth pushing on</h2>
+
+<p>If you're reading this with a reviewer hat on, these are the load-bearing decisions:</p>
+
+<ul>
+  <li><strong>hashicorp/raft over etcd-io/raft.</strong> Cleaner FSM abstraction; etcd-io/raft is "you drive the state machine, you ship the messages, you persist the log" &mdash; more flexible but blurs the library boundary. For learning architecture rather than the protocol internals, hashicorp/raft surfaces decisions at the API.</li>
+  <li><strong>Two-port over single-port gRPC transport.</strong> Avoids a third-party dep and decouples the two protocols. Cost: two listen ports per node, slightly more docker-compose noise.</li>
+  <li><strong>Local reads, not linearizable.</strong> ReadIndex via <code>VerifyLeader</code> is a half-day of work and the right next step if linearizability matters. Today, reads are fast but stale.</li>
+  <li><strong>JSON commands.</strong> Trades ~20% size for simplicity. Replacing with protobuf is purely mechanical.</li>
+  <li><strong>Static membership, single-node bootstrap.</strong> Rules out membership-management complexity (<code>AddVoter</code> / <code>RemoveVoter</code> / config-change quorum subtleties) entirely. Realistic for the project's "stable VMs with fixed IPs" assumption.</li>
+</ul>
+
+<h2 id="refs">12. References</h2>
+
+<ul>
+  <li><a href="https://raft.github.io/raft.pdf">In Search of an Understandable Consensus Algorithm (Ongaro &amp; Ousterhout, 2014)</a> &mdash; the paper. &sect;5 (basic Raft), &sect;7 (log compaction), &sect;8 (clients / linearizability), &sect;9 (membership changes).</li>
+  <li><a href="https://pkg.go.dev/github.com/hashicorp/raft"><code>hashicorp/raft</code> docs</a> &mdash; Go API reference. The <code>raft.Config</code>, <code>raft.FSM</code>, <code>raft.LogStore</code>, and <code>raft.SnapshotStore</code> interfaces are what shape this codebase.</li>
+  <li><a href="https://pkg.go.dev/github.com/hashicorp/raft-boltdb/v2"><code>hashicorp/raft-boltdb/v2</code></a> &mdash; the BoltDB-backed <code>LogStore</code> + <code>StableStore</code> used here.</li>
+  <li>Consul / Nomad source &mdash; production reference implementations that use hashicorp/raft. Look at how they handle membership and snapshots if you want to see the full operational shape.</li>
+</ul>
+
+<footer class="doc-footer">
+  raft-replicated-db &mdash; last updated 2026-05-19. Markdown version: <code>architecture.md</code>.
+</footer>
+
+</main>
+</body>
+</html>
