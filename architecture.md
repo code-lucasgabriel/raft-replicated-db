@@ -1,10 +1,10 @@
 # Architecture
 
-A replicated in-memory KV store backed by [`hashicorp/raft`](https://github.com/hashicorp/raft). This document covers component layout, data flow, persistence, failure modes, and the architectural decisions worth pushing on. An HTML companion with the same content lives at `docs/architecture.html`.
+A replicated in-memory KV store backed by [`hashicorp/raft`](https://github.com/hashicorp/raft), extended with Lamport logical clocks on every message channel and Ricart-Agrawala distributed mutual exclusion powering an atomic cluster-wide `Incr`. This document covers component layout, data flow, persistence, failure modes, and the architectural decisions worth pushing on. An HTML companion with the same content lives at `docs/architecture.html`.
 
 ## 1. Scope
 
-- **What it is:** a 3-node, static-membership KV store. Clients speak gRPC. Writes go through Raft; reads are local.
+- **What it is:** a 3-node, static-membership KV store. Clients speak gRPC. Writes go through Raft; reads are local. Every message carries a Lamport timestamp; `Incr` runs read-modify-write inside a Ricart-Agrawala critical section.
 - **What it isn't:** sharded, dynamically-membership'd, multi-region, secure-on-the-wire, observability-rich. Each of these is a deliberate non-goal for the learning version; the doc flags where each would land.
 
 ## 2. Topology
@@ -14,7 +14,7 @@ Three nodes, identical binary, two listen ports each. No external coordinator (e
 ```
                   ┌───────────────────────┐         ┌───────────────────────┐
    client ─gRPC─▶ │ node-1                │ ─raft─▶ │ node-2                │
-                  │  :5000  DBService     │         │  :5000  DBService     │
+                  │  :5000  DB+Mutex gRPC │         │  :5000  DB+Mutex gRPC │
                   │  :7000  raft TCP      │ ◀─raft─ │  :7000  raft TCP      │
                   │  /var/lib/raft-db     │         │  /var/lib/raft-db     │
                   └─────────┬─────────────┘         └───────────┬───────────┘
@@ -22,7 +22,7 @@ Three nodes, identical binary, two listen ports each. No external coordinator (e
                             ▼
                   ┌───────────────────────┐
                   │ node-3                │
-                  │  :5000  DBService     │
+                  │  :5000  DB+Mutex gRPC │
                   │  :7000  raft TCP      │
                   │  /var/lib/raft-db     │
                   └───────────────────────┘
@@ -30,36 +30,43 @@ Three nodes, identical binary, two listen ports each. No external coordinator (e
 
 Two ports per node, **separate transports**:
 
-| Port | Protocol            | Carries                                                         |
-|------|---------------------|-----------------------------------------------------------------|
-| 5000 | gRPC (HTTP/2)       | client DB API (`Get`, `Put`, `Delete`)                          |
-| 7000 | hashicorp/raft TCP  | `RequestVote`, `AppendEntries`, `InstallSnapshot` between peers |
+| Port | Protocol            | Carries                                                                    |
+|------|---------------------|-----------------------------------------------------------------------------|
+| 5000 | gRPC (HTTP/2)       | client DB API (`Get`, `Put`, `Delete`, `Incr`) + peer `Mutex` service (Ricart-Agrawala) |
+| 7000 | hashicorp/raft TCP  | `RequestVote`, `AppendEntries`, `InstallSnapshot` between peers             |
+
+Port 5000 hosts two gRPC services on one server: `DB` for clients and `Mutex` for peers. Peer nodes dial each other's gRPC port (from `GRPC_PEERS`) for two purposes: Ricart-Agrawala REQUEST/grant traffic and forwarding `Incr`'s write to the current leader.
 
 The single-port-via-gRPC alternative ([`Jille/raft-grpc-transport`](https://github.com/Jille/raft-grpc-transport)) was considered and rejected: it adds a third-party dep and re-encodes hashicorp/raft's internal messages without changing semantics. Two ports is one extra line of docker-compose and zero extra deps.
 
 ## 3. Component map
 
 ```
-cmd/main/                  process entrypoint; env-var parsing
+cmd/main/                  node entrypoint; env-var parsing
+cmd/client/                CLI client: get/put/del/incr + the bench-incr experiment
 internal/
-  node/                    composition root: builds raftnode + server, drives lifecycle
+  node/                    composition root: builds raftnode + server + mutex, drives lifecycle
   raftnode/                hashicorp/raft wiring: stores, transport, bootstrap, log output
   fsm/                     raft.FSM: decodes Commands, mutates the store, snapshot/restore
   store/                   in-memory map[string][]byte with RWMutex; Snapshot/Restore as JSON
-  server/                  client gRPC server; DB service that routes writes through raft.Apply
-  pb/db/v1/                generated protobuf bindings
+  lamport/                 Lamport logical clock: Tick (local/send), Observe (receive)
+  ramutex/                 Ricart-Agrawala algorithm core, transport-agnostic
+  server/                  gRPC services: DB (clients), Mutex (peers), peer conn pool
+  pb/                      generated protobuf bindings
 proto/db/v1/db.proto       client API schema
+proto/mutex/v1/mutex.proto peer mutex transport schema
 ```
 
 Dependency direction (anything left depends on what's to its right):
 
 ```
-cmd ─▶ node ─▶ {server, raftnode}
-         └─▶ raftnode ─▶ {fsm, store, hashicorp/raft, raft-boltdb}
-         └─▶ server   ─▶ {hashicorp/raft, fsm, store}
+cmd ─▶ node ─▶ {server, raftnode, ramutex}
+         └─▶ raftnode ─▶ {fsm, store, lamport, hashicorp/raft, raft-boltdb}
+         └─▶ server   ─▶ {hashicorp/raft, fsm, store, lamport, ramutex}
+         └─▶ ramutex  ─▶ {lamport}
 ```
 
-`server` and `raftnode` are siblings — they don't know about each other. `node` is the only package that wires them together. This is what lets you swap the gRPC layer (REST, JSON-RPC, anything) without touching the consensus layer, and vice versa.
+`server` and `raftnode` are siblings — they don't know about each other. `node` is the only package that wires them together. This is what lets you swap the gRPC layer (REST, JSON-RPC, anything) without touching the consensus layer, and vice versa. `ramutex` follows the same discipline: the algorithm core speaks to peers only through a one-method `Transport` interface; the gRPC implementation of that interface lives in `server`, so the algorithm is unit-testable with an in-process transport.
 
 ## 4. The write path
 
@@ -152,6 +159,7 @@ Both are deferred. The static-VM assumption is the project's design constraint.
 | Total outage, BoltDB intact            | Cluster restarts; each node reads `raft-log.db` + `raft-stable.db` from disk.       | Election happens, log replays into the FSM, service resumes from `lastApplied`.                              |
 | Total outage, BoltDB corrupt           | Bootstrap won't help (state exists or is partially written).                        | `raft.RecoverCluster` with a hand-written `peers.json` is the documented disaster path. Out of scope here.   |
 | Single node BoltDB lost (volume nuked) | That node looks brand-new to itself but is still a voter in the live config.        | On boot the live leader sends a snapshot + AppendEntries; node catches up. No bootstrap needed.              |
+| Any node down, locked `Incr` issued    | Ricart-Agrawala needs a grant from EVERY peer: acquisition blocks, `Incr` fails at the lock timeout. Raft ops (`Put`/`Get`/`Delete`) continue unaffected. | Restart the node. This all-peers fragility is inherent to RA — see §11 for the contrast with quorum-based approaches. |
 
 The "single node volume nuked" case is the one most people get wrong on a first build: don't try to re-bootstrap. Just bring the node back with the same `NODE_ID` and empty `DATA_DIR`; the leader will repair it.
 
@@ -165,14 +173,58 @@ The FSM is intentionally trivial — a `map[string][]byte`. The interesting prop
 
 The choice of JSON for the `Command` encoding is a KISS call: legible in logs, no codegen, easy to extend. Switching to protobuf is mechanical and would buy ~20% smaller log entries.
 
-## 10. Process layout
+## 10. Logical time
+
+Every process — the three nodes *and* the CLI client — owns one Lamport clock (`internal/lamport`), following the two rules from Lamport 1978: `Tick()` before a local event or message send, `Observe(remote) = max(local, remote) + 1` on receive. Three message channels carry timestamps:
+
+| Channel | Send event | Receive event |
+|---|---|---|
+| client ↔ node | request/response `lamport_time` fields; both sides Tick on send | both sides Observe |
+| leader → replicas | `Command{Time, Origin}` stamped at `raft.Apply` propose | every node's `FSM.Apply` Observes — a committed log entry *is* a message from the leader to each replica |
+| peer ↔ peer (mutex) | REQUEST carries the requester's fixed timestamp; the grant response carries the granter's clock | both sides Observe |
+
+Two properties worth internalizing:
+
+- **The clock is node state, not FSM state.** `FSM.Apply` observing `cmd.Time` is a local side effect: it isn't snapshotted and can't influence the replicated store, so apply determinism survives. Replaying old entries after a restart re-observes old timestamps — harmless, `Observe` is a max.
+- **Lamport order is partial; ids make it total.** `ts(a) < ts(b)` does not imply a happened before b (they may be concurrent). Ricart-Agrawala needs a *total* order, so it compares `(timestamp, node id)` pairs — that tie-break is exactly why the mutex and the clock ship together.
+
+## 11. Distributed mutual exclusion and `Incr`
+
+`internal/ramutex` implements Ricart & Agrawala 1981. To enter the critical section a node stamps one REQUEST with its Lamport clock and sends it to every peer, entering only when **all** of them grant. A receiver grants immediately unless it holds the CS or is requesting with an earlier `(timestamp, id)` pair — then it defers the grant until its own exit. 2·(N−1) messages per entry, the paper's optimal count.
+
+The paper's REQUEST/REPLY pair maps onto **one blocking gRPC call**: `Mutex.RequestCS` carries the REQUEST; the response is the grant; deferring = not responding yet. That turns the trickiest part of the protocol (the deferred-reply queue) into an idiomatic Go structure: a slice of channels closed on `Unlock`.
+
+Correctness hangs on two details, both enforced under a single mutex in `ramutex`:
+
+- the request timestamp is fixed **before** any REQUEST leaves and never changes mid-request, so every pairwise conflict compares identical pairs on both sides;
+- `Observe` runs before the grant/defer decision, so if node A saw B's request before requesting itself, A's timestamp is strictly greater — both sides agree who came first.
+
+`Incr(key)` makes the lock load-bearing. It is a read-modify-write — exactly the operation the KV API cannot do atomically (there is no CAS) — and it works on *any* node:
+
+```
+1.  node-X receives Incr           (any node, no leader hint needed)
+2.  ramutex.Lock()                 REQUEST to all peers, wait for all grants
+3.  resolve the Raft leader
+      X is leader:   raft.Barrier() → store.Get → propose Put
+      X is follower: forward Incr{unsafe:true} to the leader over peer gRPC
+4.  ramutex.Unlock()               release deferred grants
+```
+
+Step 3's `Barrier` closes a subtle window: a freshly elected leader has *committed* the previous CS holder's write but may not have *applied* it yet; reading before the barrier could lose an update despite the lock. The forwarded call sets `unsafe=true` because the CS is already held at the origin — taking it again on the leader would deadlock waiting for a grant the origin can't give while inside the CS.
+
+The `unsafe` flag is also client-reachable on purpose: `bench-incr -unsafe` is the control arm of the lost-update experiment (concurrent unlocked increments race and drop updates; locked runs land exactly on `baseline + N`).
+
+**The availability contrast with Raft is the lesson of this section.** Raft makes progress with any majority (1 of 3 nodes down is fine). Ricart-Agrawala requires a grant from *every* peer — one dead node blocks all lock acquisitions until its timeout. Quorum-based mutual exclusion (Maekawa) or lease-based locks trade that off differently; here the fragility is kept visible because the contrast is instructive.
+
+## 12. Process layout
 
 A single binary (`cmd/main`) runs per node. Inside the binary:
 
 ```
 main goroutine
   └─ node.Run
-       ├─ goroutine: gRPC server (server.Server.Serve)
+       ├─ goroutine: gRPC server (server.Server.Serve) — DB + Mutex services,
+       │             one goroutine per in-flight RPC (deferred grants park here)
        └─ goroutine: leader-change logger (polls raft.State / raft.LeaderWithID every 500ms)
 
 hashicorp/raft (internal, library-owned)
@@ -186,7 +238,7 @@ hashicorp/raft (internal, library-owned)
 
 Shutdown is straightforward: on `SIGINT`/`SIGTERM`, `cmd/main` cancels the root context. `node.Run` calls `server.GracefulStop` (draining in-flight gRPC), then `raft.Raft.Shutdown` (closing the transport, flushing BoltDB, releasing locks). The transport's TCP listener and the gRPC listener are both closed by these calls.
 
-## 11. Choices worth pushing on
+## 13. Choices worth pushing on
 
 If you're reading this with a reviewer hat on, these are the load-bearing decisions:
 
@@ -195,10 +247,14 @@ If you're reading this with a reviewer hat on, these are the load-bearing decisi
 - **Local reads, not linearizable.** ReadIndex via `VerifyLeader` is a half-day of work and the right next step if linearizability matters. Today, reads are fast but stale.
 - **JSON commands.** Trades ~20% size for simplicity. Replacing with protobuf is purely mechanical.
 - **Static membership, single-node bootstrap.** Rules out the membership-management complexity (`AddVoter` / `RemoveVoter` / config-change quorum subtleties) entirely. Realistic for the project's "stable VMs with fixed IPs" assumption.
+- **Ricart-Agrawala over a Raft-backed lock service.** A lock FSM on top of Raft would be more available (majority quorum vs all-peers) and is how production systems do it (Chubby, etcd locks). RA was chosen because it is a *distinct* algorithm with its own message exchange — and because it composes with the Lamport clock instead of leaving it decorative.
+- **Blocking RPC as REQUEST/REPLY.** Holding the gRPC response open encodes the deferred reply naturally. Cost: one parked goroutine + HTTP/2 stream per deferred grant — irrelevant at N=3, a real consideration at large N or with slow CS holders.
 
-## 12. References
+## 14. References
 
 - [In Search of an Understandable Consensus Algorithm (Ongaro & Ousterhout, 2014)](https://raft.github.io/raft.pdf) — the paper. §5 (basic Raft), §7 (log compaction), §8 (clients / linearizability), §9 (membership changes).
+- [Time, Clocks, and the Ordering of Events in a Distributed System (Lamport, CACM 1978)](https://lamport.azurewebsites.net/pubs/time-clocks.pdf) — the logical-clock rules implemented in `internal/lamport`, and the happens-before relation the mutex depends on.
+- [An Optimal Algorithm for Mutual Exclusion in Computer Networks (Ricart & Agrawala, CACM 1981)](https://dl.acm.org/doi/10.1145/358527.358537) — the algorithm implemented in `internal/ramutex`, including the 2·(N−1) message-count optimality argument.
 - [`hashicorp/raft` docs](https://pkg.go.dev/github.com/hashicorp/raft) — Go API reference. The `raft.Config`, `raft.FSM`, `raft.LogStore`, and `raft.SnapshotStore` interfaces are what shape this codebase.
 - [`hashicorp/raft-boltdb/v2`](https://pkg.go.dev/github.com/hashicorp/raft-boltdb/v2) — the BoltDB-backed `LogStore` + `StableStore` used here.
 - Consul / Nomad source — production reference implementations that use hashicorp/raft. Look at how they handle membership and snapshots if you want to see the full operational shape.

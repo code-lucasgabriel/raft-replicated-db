@@ -6,9 +6,13 @@ proto:
 
 build:
 	go build -o bin/node ./cmd/main
+	go build -o bin/client ./cmd/client
 
 run: build
 	./bin/node
+
+test:
+	go test -race ./...
 
 tidy:
 	go mod tidy

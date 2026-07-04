@@ -8,7 +8,7 @@ version: '3'
 # in the per-node data volume drives recovery.
 #
 # Each node listens on TWO ports:
-#   - 5000: client-facing gRPC (DB API)
+#   - 5000: gRPC — client DB API + peer Ricart-Agrawala mutex service
 #   - 7000: Raft TCP transport (peers only; not exposed to the host)
 #
 # Per-node named volumes keep BoltDB files and snapshots across restarts.
@@ -21,6 +21,7 @@ services:
       - NODE_PORT=5000
       - DATA_DIR=/var/lib/raft-db
       - PEERS=node-1=node-1:7000,node-2=node-2:7000,node-3=node-3:7000
+      - GRPC_PEERS=node-1=node-1:5000,node-2=node-2:5000,node-3=node-3:5000
       - BOOTSTRAP=true
     volumes:
       - node1-data:/var/lib/raft-db
@@ -35,6 +36,7 @@ services:
       - NODE_PORT=5000
       - DATA_DIR=/var/lib/raft-db
       - PEERS=node-1=node-1:7000,node-2=node-2:7000,node-3=node-3:7000
+      - GRPC_PEERS=node-1=node-1:5000,node-2=node-2:5000,node-3=node-3:5000
     volumes:
       - node2-data:/var/lib/raft-db
     ports:
@@ -48,6 +50,7 @@ services:
       - NODE_PORT=5000
       - DATA_DIR=/var/lib/raft-db
       - PEERS=node-1=node-1:7000,node-2=node-2:7000,node-3=node-3:7000
+      - GRPC_PEERS=node-1=node-1:5000,node-2=node-2:5000,node-3=node-3:5000
     volumes:
       - node3-data:/var/lib/raft-db
     ports:
