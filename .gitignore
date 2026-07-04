@@ -1,1 +1,3 @@
 raft-replicated-db-vault/
+.DS_Store
+bin/
