@@ -3,19 +3,30 @@ package server
 import (
 	"context"
 	"errors"
+	"strconv"
 	"time"
 
 	"github.com/hashicorp/raft"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	dbv1 "github.com/code-lucasgabriel/raft-replicated-db/internal/pb/db/v1"
 	"github.com/code-lucasgabriel/raft-replicated-db/internal/fsm"
 	"github.com/code-lucasgabriel/raft-replicated-db/internal/lamport"
+	"github.com/code-lucasgabriel/raft-replicated-db/internal/ramutex"
 	"github.com/code-lucasgabriel/raft-replicated-db/internal/store"
 )
 
 // applyTimeout caps how long a Put / Delete waits for Raft to commit and apply.
 // Tuned for a single-DC cluster.
 const applyTimeout = 5 * time.Second
+
+// lockTimeout caps how long an Incr waits to enter the distributed critical
+// section when the client didn't set its own deadline. Ricart-Agrawala needs
+// a grant from EVERY peer, so a single dead node blocks acquisition until
+// this fires — the availability trade-off mutual exclusion makes and Raft
+// (quorum-based) doesn't.
+const lockTimeout = 30 * time.Second
 
 // DBService is the client-facing key/value API.
 //
@@ -39,10 +50,12 @@ type DBService struct {
 	raft   *raft.Raft
 	store  *store.KV
 	clock  *lamport.Clock
+	mtx    *ramutex.Mutex
+	peers  *Peers
 }
 
-func NewDBService(nodeID string, r *raft.Raft, s *store.KV, c *lamport.Clock) *DBService {
-	return &DBService{nodeID: nodeID, raft: r, store: s, clock: c}
+func NewDBService(nodeID string, r *raft.Raft, s *store.KV, c *lamport.Clock, mtx *ramutex.Mutex, peers *Peers) *DBService {
+	return &DBService{nodeID: nodeID, raft: r, store: s, clock: c, mtx: mtx, peers: peers}
 }
 
 func (s *DBService) Get(_ context.Context, req *dbv1.GetRequest) (*dbv1.GetResponse, error) {
@@ -72,6 +85,127 @@ func (s *DBService) Delete(_ context.Context, req *dbv1.DeleteRequest) (*dbv1.De
 		return nil, err
 	}
 	return &dbv1.DeleteResponse{LeaderHint: hint, LamportTime: s.clock.Tick()}, nil
+}
+
+// Incr atomically increments a numeric key cluster-wide. Unlike Put/Delete
+// it works on ANY node: the receiving node enters the Ricart-Agrawala
+// critical section (so no other locked Incr runs anywhere in the cluster),
+// then performs read-modify-write against the Raft leader, then releases.
+//
+// With unsafe=true the lock is skipped. That serves the lost-update
+// experiment (concurrent unsafe Incrs race on read-modify-write) and
+// internal forwarding: a node already inside the CS forwards to the leader
+// with unsafe=true — taking the lock again there would deadlock, since the
+// leader would wait for a grant this node can't give while holding the CS.
+func (s *DBService) Incr(ctx context.Context, req *dbv1.IncrRequest) (*dbv1.IncrResponse, error) {
+	s.clock.Observe(req.GetLamportTime())
+
+	if !req.GetUnsafe() {
+		lockCtx := ctx
+		if _, ok := ctx.Deadline(); !ok {
+			var cancel context.CancelFunc
+			lockCtx, cancel = context.WithTimeout(ctx, lockTimeout)
+			defer cancel()
+		}
+		if err := s.mtx.Lock(lockCtx); err != nil {
+			return nil, status.Errorf(codes.Unavailable, "acquire distributed lock: %v", err)
+		}
+		defer s.mtx.Unlock()
+	}
+
+	newVal, err := s.execIncr(ctx, req.GetKey(), req.GetDelta())
+	if err != nil {
+		return nil, err
+	}
+	return &dbv1.IncrResponse{NewValue: newVal, LamportTime: s.clock.Tick()}, nil
+}
+
+// execIncr performs the read-modify-write on the current Raft leader,
+// retrying through leader changes. Local leader path: a raft Barrier first,
+// so a freshly elected leader has applied every previously committed entry
+// before we read (otherwise the read could miss the previous CS holder's
+// write and lose an update despite the lock).
+func (s *DBService) execIncr(ctx context.Context, key string, delta int64) (int64, error) {
+	const attempts = 3
+	for i := 0; i < attempts; i++ {
+		if err := ctx.Err(); err != nil {
+			return 0, status.FromContextError(err).Err()
+		}
+		_, leaderID := s.raft.LeaderWithID()
+		switch {
+		case leaderID == "":
+			// No leader (election in progress) — wait and re-resolve.
+			select {
+			case <-time.After(300 * time.Millisecond):
+			case <-ctx.Done():
+				return 0, status.FromContextError(ctx.Err()).Err()
+			}
+
+		case string(leaderID) == s.nodeID:
+			newVal, retry, err := s.localIncr(key, delta)
+			if err != nil {
+				return 0, err
+			}
+			if !retry {
+				return newVal, nil
+			}
+			// Lost leadership mid-operation; re-resolve.
+
+		default:
+			client, err := s.peers.DB(string(leaderID))
+			if err != nil {
+				return 0, status.Errorf(codes.Internal, "leader %s not in peer set: %v", leaderID, err)
+			}
+			resp, err := client.Incr(ctx, &dbv1.IncrRequest{
+				Key:         key,
+				Delta:       delta,
+				Unsafe:      true, // the CS is already held by this node (or deliberately skipped)
+				LamportTime: s.clock.Tick(),
+			})
+			if err != nil {
+				// The presumed leader may have just lost leadership or died;
+				// re-resolve and retry unless the error is the value's fault.
+				if status.Code(err) == codes.InvalidArgument {
+					return 0, err
+				}
+				continue
+			}
+			s.clock.Observe(resp.GetLamportTime())
+			return resp.GetNewValue(), nil
+		}
+	}
+	return 0, status.Errorf(codes.Unavailable, "incr %q: no stable leader after %d attempts", key, attempts)
+}
+
+// localIncr runs the read-modify-write on this node while it is leader.
+// retry=true means leadership was lost and the caller should re-resolve.
+func (s *DBService) localIncr(key string, delta int64) (newVal int64, retry bool, err error) {
+	// Barrier: block until everything committed before now is applied to
+	// our FSM. Covers the window right after winning an election.
+	if err := s.raft.Barrier(applyTimeout).Error(); err != nil {
+		if errors.Is(err, raft.ErrNotLeader) || errors.Is(err, raft.ErrLeadershipLost) {
+			return 0, true, nil
+		}
+		return 0, false, status.Errorf(codes.Unavailable, "raft barrier: %v", err)
+	}
+
+	cur := int64(0)
+	if raw, ok := s.store.Get(key); ok {
+		cur, err = strconv.ParseInt(string(raw), 10, 64)
+		if err != nil {
+			return 0, false, status.Errorf(codes.InvalidArgument, "key %q holds non-numeric value %q", key, raw)
+		}
+	}
+	newVal = cur + delta
+
+	hint, err := s.propose(fsm.Command{Op: "put", Key: key, Value: []byte(strconv.FormatInt(newVal, 10))})
+	if err != nil {
+		return 0, false, err
+	}
+	if hint != "" {
+		return 0, true, nil // deposed between Barrier and Apply
+	}
+	return newVal, false, nil
 }
 
 // propose runs a command through Raft. Returns ("", nil) on success;

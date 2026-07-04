@@ -16,6 +16,11 @@ service DB {
   rpc Get(GetRequest) returns (GetResponse);
   rpc Put(PutRequest) returns (PutResponse);
   rpc Delete(DeleteRequest) returns (DeleteResponse);
+  // Incr atomically increments a numeric key cluster-wide: the receiving
+  // node enters the Ricart-Agrawala critical section, performs
+  // read-modify-write against the Raft leader, and releases the CS. Works
+  // on any node — no leader hint needed.
+  rpc Incr(IncrRequest) returns (IncrResponse);
 }
 
 message GetRequest {
@@ -50,5 +55,23 @@ message DeleteRequest {
 
 message DeleteResponse {
   string leader_hint = 1;
+  uint64 lamport_time = 2;
+}
+
+message IncrRequest {
+  string key = 1;
+  // Amount to add; the value must be (or become) a decimal integer string.
+  int64 delta = 2;
+  // Skip the distributed lock. Exists for two reasons: (1) the lost-update
+  // experiment — concurrent unsafe increments race on read-modify-write;
+  // (2) internal forwarding — a node already holding the CS forwards the
+  // increment to the leader with unsafe=true, so the leader executes it
+  // under the origin node's lock instead of deadlocking on a second one.
+  bool unsafe = 3;
+  uint64 lamport_time = 4;
+}
+
+message IncrResponse {
+  int64 new_value = 1;
   uint64 lamport_time = 2;
 }

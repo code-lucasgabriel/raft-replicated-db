@@ -4,6 +4,8 @@ modules:
 lint:
   use:
     - STANDARD
+  except:
+    - SERVICE_SUFFIX # DB / Mutex read better than DBService / MutexService
 breaking:
   use:
     - FILE

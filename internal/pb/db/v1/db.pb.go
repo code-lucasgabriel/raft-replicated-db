@@ -359,6 +359,132 @@ func (x *DeleteResponse) GetLamportTime() uint64 {
 	return 0
 }
 
+type IncrRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Key   string                 `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
+	// Amount to add; the value must be (or become) a decimal integer string.
+	Delta int64 `protobuf:"varint,2,opt,name=delta,proto3" json:"delta,omitempty"`
+	// Skip the distributed lock. Exists for two reasons: (1) the lost-update
+	// experiment — concurrent unsafe increments race on read-modify-write;
+	// (2) internal forwarding — a node already holding the CS forwards the
+	// increment to the leader with unsafe=true, so the leader executes it
+	// under the origin node's lock instead of deadlocking on a second one.
+	Unsafe        bool   `protobuf:"varint,3,opt,name=unsafe,proto3" json:"unsafe,omitempty"`
+	LamportTime   uint64 `protobuf:"varint,4,opt,name=lamport_time,json=lamportTime,proto3" json:"lamport_time,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *IncrRequest) Reset() {
+	*x = IncrRequest{}
+	mi := &file_db_v1_db_proto_msgTypes[6]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *IncrRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*IncrRequest) ProtoMessage() {}
+
+func (x *IncrRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_db_v1_db_proto_msgTypes[6]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use IncrRequest.ProtoReflect.Descriptor instead.
+func (*IncrRequest) Descriptor() ([]byte, []int) {
+	return file_db_v1_db_proto_rawDescGZIP(), []int{6}
+}
+
+func (x *IncrRequest) GetKey() string {
+	if x != nil {
+		return x.Key
+	}
+	return ""
+}
+
+func (x *IncrRequest) GetDelta() int64 {
+	if x != nil {
+		return x.Delta
+	}
+	return 0
+}
+
+func (x *IncrRequest) GetUnsafe() bool {
+	if x != nil {
+		return x.Unsafe
+	}
+	return false
+}
+
+func (x *IncrRequest) GetLamportTime() uint64 {
+	if x != nil {
+		return x.LamportTime
+	}
+	return 0
+}
+
+type IncrResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	NewValue      int64                  `protobuf:"varint,1,opt,name=new_value,json=newValue,proto3" json:"new_value,omitempty"`
+	LamportTime   uint64                 `protobuf:"varint,2,opt,name=lamport_time,json=lamportTime,proto3" json:"lamport_time,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *IncrResponse) Reset() {
+	*x = IncrResponse{}
+	mi := &file_db_v1_db_proto_msgTypes[7]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *IncrResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*IncrResponse) ProtoMessage() {}
+
+func (x *IncrResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_db_v1_db_proto_msgTypes[7]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use IncrResponse.ProtoReflect.Descriptor instead.
+func (*IncrResponse) Descriptor() ([]byte, []int) {
+	return file_db_v1_db_proto_rawDescGZIP(), []int{7}
+}
+
+func (x *IncrResponse) GetNewValue() int64 {
+	if x != nil {
+		return x.NewValue
+	}
+	return 0
+}
+
+func (x *IncrResponse) GetLamportTime() uint64 {
+	if x != nil {
+		return x.LamportTime
+	}
+	return 0
+}
+
 var File_db_v1_db_proto protoreflect.FileDescriptor
 
 const file_db_v1_db_proto_rawDesc = "" +
@@ -389,11 +515,20 @@ const file_db_v1_db_proto_rawDesc = "" +
 	"\x0eDeleteResponse\x12\x1f\n" +
 	"\vleader_hint\x18\x01 \x01(\tR\n" +
 	"leaderHint\x12!\n" +
-	"\flamport_time\x18\x02 \x01(\x04R\vlamportTime2\x97\x01\n" +
+	"\flamport_time\x18\x02 \x01(\x04R\vlamportTime\"p\n" +
+	"\vIncrRequest\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
+	"\x05delta\x18\x02 \x01(\x03R\x05delta\x12\x16\n" +
+	"\x06unsafe\x18\x03 \x01(\bR\x06unsafe\x12!\n" +
+	"\flamport_time\x18\x04 \x01(\x04R\vlamportTime\"N\n" +
+	"\fIncrResponse\x12\x1b\n" +
+	"\tnew_value\x18\x01 \x01(\x03R\bnewValue\x12!\n" +
+	"\flamport_time\x18\x02 \x01(\x04R\vlamportTime2\xc8\x01\n" +
 	"\x02DB\x12,\n" +
 	"\x03Get\x12\x11.db.v1.GetRequest\x1a\x12.db.v1.GetResponse\x12,\n" +
 	"\x03Put\x12\x11.db.v1.PutRequest\x1a\x12.db.v1.PutResponse\x125\n" +
-	"\x06Delete\x12\x14.db.v1.DeleteRequest\x1a\x15.db.v1.DeleteResponseBHZFgithub.com/code-lucasgabriel/raft-replicated-db/internal/pb/db/v1;dbv1b\x06proto3"
+	"\x06Delete\x12\x14.db.v1.DeleteRequest\x1a\x15.db.v1.DeleteResponse\x12/\n" +
+	"\x04Incr\x12\x12.db.v1.IncrRequest\x1a\x13.db.v1.IncrResponseBHZFgithub.com/code-lucasgabriel/raft-replicated-db/internal/pb/db/v1;dbv1b\x06proto3"
 
 var (
 	file_db_v1_db_proto_rawDescOnce sync.Once
@@ -407,7 +542,7 @@ func file_db_v1_db_proto_rawDescGZIP() []byte {
 	return file_db_v1_db_proto_rawDescData
 }
 
-var file_db_v1_db_proto_msgTypes = make([]protoimpl.MessageInfo, 6)
+var file_db_v1_db_proto_msgTypes = make([]protoimpl.MessageInfo, 8)
 var file_db_v1_db_proto_goTypes = []any{
 	(*GetRequest)(nil),     // 0: db.v1.GetRequest
 	(*GetResponse)(nil),    // 1: db.v1.GetResponse
@@ -415,16 +550,20 @@ var file_db_v1_db_proto_goTypes = []any{
 	(*PutResponse)(nil),    // 3: db.v1.PutResponse
 	(*DeleteRequest)(nil),  // 4: db.v1.DeleteRequest
 	(*DeleteResponse)(nil), // 5: db.v1.DeleteResponse
+	(*IncrRequest)(nil),    // 6: db.v1.IncrRequest
+	(*IncrResponse)(nil),   // 7: db.v1.IncrResponse
 }
 var file_db_v1_db_proto_depIdxs = []int32{
 	0, // 0: db.v1.DB.Get:input_type -> db.v1.GetRequest
 	2, // 1: db.v1.DB.Put:input_type -> db.v1.PutRequest
 	4, // 2: db.v1.DB.Delete:input_type -> db.v1.DeleteRequest
-	1, // 3: db.v1.DB.Get:output_type -> db.v1.GetResponse
-	3, // 4: db.v1.DB.Put:output_type -> db.v1.PutResponse
-	5, // 5: db.v1.DB.Delete:output_type -> db.v1.DeleteResponse
-	3, // [3:6] is the sub-list for method output_type
-	0, // [0:3] is the sub-list for method input_type
+	6, // 3: db.v1.DB.Incr:input_type -> db.v1.IncrRequest
+	1, // 4: db.v1.DB.Get:output_type -> db.v1.GetResponse
+	3, // 5: db.v1.DB.Put:output_type -> db.v1.PutResponse
+	5, // 6: db.v1.DB.Delete:output_type -> db.v1.DeleteResponse
+	7, // 7: db.v1.DB.Incr:output_type -> db.v1.IncrResponse
+	4, // [4:8] is the sub-list for method output_type
+	0, // [0:4] is the sub-list for method input_type
 	0, // [0:0] is the sub-list for extension type_name
 	0, // [0:0] is the sub-list for extension extendee
 	0, // [0:0] is the sub-list for field type_name
@@ -441,7 +580,7 @@ func file_db_v1_db_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_db_v1_db_proto_rawDesc), len(file_db_v1_db_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   6,
+			NumMessages:   8,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

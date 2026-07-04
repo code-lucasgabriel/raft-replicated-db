@@ -1,0 +1,32 @@
+syntax = "proto3";
+
+package mutex.v1;
+
+option go_package = "github.com/code-lucasgabriel/raft-replicated-db/internal/pb/mutex/v1;mutexv1";
+
+// Mutex is the peer-to-peer transport for Ricart-Agrawala distributed
+// mutual exclusion. Nodes call each other on the same gRPC port that serves
+// the client DB API.
+//
+// The paper's REQUEST/REPLY message pair maps onto one blocking RPC: the
+// call carries the REQUEST; the response IS the grant. A node that must
+// defer (it holds the CS, or its own request has priority) simply does not
+// respond until it exits the critical section.
+service Mutex {
+  rpc RequestCS(RequestCSRequest) returns (RequestCSResponse);
+}
+
+message RequestCSRequest {
+  // Requesting node's id. Unique ids break Lamport-timestamp ties,
+  // extending the clock's partial order to the total order the algorithm
+  // needs.
+  string node_id = 1;
+  // The requester's Lamport timestamp, fixed once per request — every peer
+  // receives the same (lamport_time, node_id) pair.
+  uint64 lamport_time = 2;
+}
+
+message RequestCSResponse {
+  // Granter's clock at the moment of the grant (a message send event).
+  uint64 lamport_time = 1;
+}

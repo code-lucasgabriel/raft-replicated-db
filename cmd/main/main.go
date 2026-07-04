@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"log"
+	"net"
 	"os"
 	"os/signal"
 	"strconv"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/code-lucasgabriel/raft-replicated-db/internal/node"
 	"github.com/code-lucasgabriel/raft-replicated-db/internal/raftnode"
+	"github.com/code-lucasgabriel/raft-replicated-db/internal/server"
 )
 
 func main() {
@@ -23,6 +25,11 @@ func main() {
 	}
 	// Local Raft bind address is the entry in PEERS that matches NODE_ID.
 	cfg.BindAddr = peerAddrOrDie(cfg.NodeID, cfg.Peers)
+	// gRPC peer endpoints (Ricart-Agrawala + leader forwarding). When
+	// GRPC_PEERS is unset, derive them: same host as the Raft address, gRPC
+	// port — right for docker-compose, where every node uses one NODE_PORT.
+	// Multi-node-on-localhost setups (distinct ports) must set GRPC_PEERS.
+	cfg.GRPCPeers = grpcPeers(os.Getenv("GRPC_PEERS"), cfg.Peers, cfg.GRPCPort)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
@@ -54,6 +61,29 @@ func mustParsePeers(raw string) []raftnode.Peer {
 	}
 	if len(peers) == 0 {
 		log.Fatal("PEERS must contain at least one entry")
+	}
+	return peers
+}
+
+// grpcPeers parses GRPC_PEERS ("id1=addr1,...") or, when raw is empty,
+// derives each peer's gRPC endpoint from its Raft host + the shared gRPC
+// port.
+func grpcPeers(raw string, raftPeers []raftnode.Peer, grpcPort int) []server.Peer {
+	if raw != "" {
+		parsed := mustParsePeers(raw)
+		peers := make([]server.Peer, 0, len(parsed))
+		for _, p := range parsed {
+			peers = append(peers, server.Peer{ID: p.ID, Addr: p.Addr})
+		}
+		return peers
+	}
+	peers := make([]server.Peer, 0, len(raftPeers))
+	for _, p := range raftPeers {
+		host, _, err := net.SplitHostPort(p.Addr)
+		if err != nil {
+			log.Fatalf("invalid peer address %q: %v", p.Addr, err)
+		}
+		peers = append(peers, server.Peer{ID: p.ID, Addr: net.JoinHostPort(host, strconv.Itoa(grpcPort))})
 	}
 	return peers
 }

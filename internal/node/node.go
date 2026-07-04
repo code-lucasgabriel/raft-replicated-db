@@ -12,6 +12,7 @@ import (
 
 	"github.com/code-lucasgabriel/raft-replicated-db/internal/lamport"
 	"github.com/code-lucasgabriel/raft-replicated-db/internal/raftnode"
+	"github.com/code-lucasgabriel/raft-replicated-db/internal/ramutex"
 	"github.com/code-lucasgabriel/raft-replicated-db/internal/server"
 )
 
@@ -21,13 +22,15 @@ type Config struct {
 	BindAddr  string          // local Raft TCP listen address ("host:port")
 	DataDir   string          // BoltDB + snapshots
 	Peers     []raftnode.Peer // full cluster membership including self (raft addresses)
+	GRPCPeers []server.Peer   // same membership, but the gRPC endpoints (mutex + forwarding)
 	Bootstrap bool            // first node, first boot only
 }
 
 type Node struct {
-	cfg     Config
-	server  *server.Server
-	raftN   *raftnode.Node
+	cfg    Config
+	server *server.Server
+	raftN  *raftnode.Node
+	peers  *server.Peers
 }
 
 func New(cfg Config) (*Node, error) {
@@ -49,14 +52,35 @@ func New(cfg Config) (*Node, error) {
 		return nil, err
 	}
 
-	dbSvc := server.NewDBService(cfg.NodeID, rn.Raft, rn.Store, clock)
-	srv, err := server.New(cfg.GRPCPort, dbSvc)
+	// Peer gRPC conns power two things: the Ricart-Agrawala transport and
+	// Incr's forwarding to the leader. Conns are lazy, so boot order across
+	// the cluster doesn't matter.
+	peers, err := server.NewPeers(cfg.NodeID, cfg.GRPCPeers)
 	if err != nil {
 		_ = rn.Raft.Shutdown().Error()
 		return nil, err
 	}
+	mtx := ramutex.New(cfg.NodeID, peerIDs(cfg.GRPCPeers), clock,
+		server.NewMutexTransport(cfg.NodeID, peers, clock))
 
-	return &Node{cfg: cfg, server: srv, raftN: rn}, nil
+	dbSvc := server.NewDBService(cfg.NodeID, rn.Raft, rn.Store, clock, mtx, peers)
+	mutexSvc := server.NewMutexService(mtx, clock)
+	srv, err := server.New(cfg.GRPCPort, dbSvc, mutexSvc)
+	if err != nil {
+		peers.Close()
+		_ = rn.Raft.Shutdown().Error()
+		return nil, err
+	}
+
+	return &Node{cfg: cfg, server: srv, raftN: rn, peers: peers}, nil
+}
+
+func peerIDs(peers []server.Peer) []string {
+	ids := make([]string, 0, len(peers))
+	for _, p := range peers {
+		ids = append(ids, p.ID)
+	}
+	return ids
 }
 
 func (n *Node) Run(ctx context.Context) error {
@@ -71,11 +95,13 @@ func (n *Node) Run(ctx context.Context) error {
 	select {
 	case <-ctx.Done():
 		n.server.GracefulStop()
+		n.peers.Close()
 		if err := n.raftN.Raft.Shutdown().Error(); err != nil {
 			log.Printf("raft shutdown: %v", err)
 		}
 		return ctx.Err()
 	case err := <-srvErrCh:
+		n.peers.Close()
 		_ = n.raftN.Raft.Shutdown().Error()
 		return err
 	}

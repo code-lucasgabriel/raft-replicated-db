@@ -22,6 +22,7 @@ const (
 	DB_Get_FullMethodName    = "/db.v1.DB/Get"
 	DB_Put_FullMethodName    = "/db.v1.DB/Put"
 	DB_Delete_FullMethodName = "/db.v1.DB/Delete"
+	DB_Incr_FullMethodName   = "/db.v1.DB/Incr"
 )
 
 // DBClient is the client API for DB service.
@@ -40,6 +41,11 @@ type DBClient interface {
 	Get(ctx context.Context, in *GetRequest, opts ...grpc.CallOption) (*GetResponse, error)
 	Put(ctx context.Context, in *PutRequest, opts ...grpc.CallOption) (*PutResponse, error)
 	Delete(ctx context.Context, in *DeleteRequest, opts ...grpc.CallOption) (*DeleteResponse, error)
+	// Incr atomically increments a numeric key cluster-wide: the receiving
+	// node enters the Ricart-Agrawala critical section, performs
+	// read-modify-write against the Raft leader, and releases the CS. Works
+	// on any node — no leader hint needed.
+	Incr(ctx context.Context, in *IncrRequest, opts ...grpc.CallOption) (*IncrResponse, error)
 }
 
 type dBClient struct {
@@ -80,6 +86,16 @@ func (c *dBClient) Delete(ctx context.Context, in *DeleteRequest, opts ...grpc.C
 	return out, nil
 }
 
+func (c *dBClient) Incr(ctx context.Context, in *IncrRequest, opts ...grpc.CallOption) (*IncrResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(IncrResponse)
+	err := c.cc.Invoke(ctx, DB_Incr_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // DBServer is the server API for DB service.
 // All implementations must embed UnimplementedDBServer
 // for forward compatibility.
@@ -96,6 +112,11 @@ type DBServer interface {
 	Get(context.Context, *GetRequest) (*GetResponse, error)
 	Put(context.Context, *PutRequest) (*PutResponse, error)
 	Delete(context.Context, *DeleteRequest) (*DeleteResponse, error)
+	// Incr atomically increments a numeric key cluster-wide: the receiving
+	// node enters the Ricart-Agrawala critical section, performs
+	// read-modify-write against the Raft leader, and releases the CS. Works
+	// on any node — no leader hint needed.
+	Incr(context.Context, *IncrRequest) (*IncrResponse, error)
 	mustEmbedUnimplementedDBServer()
 }
 
@@ -114,6 +135,9 @@ func (UnimplementedDBServer) Put(context.Context, *PutRequest) (*PutResponse, er
 }
 func (UnimplementedDBServer) Delete(context.Context, *DeleteRequest) (*DeleteResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Delete not implemented")
+}
+func (UnimplementedDBServer) Incr(context.Context, *IncrRequest) (*IncrResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method Incr not implemented")
 }
 func (UnimplementedDBServer) mustEmbedUnimplementedDBServer() {}
 func (UnimplementedDBServer) testEmbeddedByValue()            {}
@@ -190,6 +214,24 @@ func _DB_Delete_Handler(srv interface{}, ctx context.Context, dec func(interface
 	return interceptor(ctx, in, info, handler)
 }
 
+func _DB_Incr_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(IncrRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(DBServer).Incr(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: DB_Incr_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(DBServer).Incr(ctx, req.(*IncrRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // DB_ServiceDesc is the grpc.ServiceDesc for DB service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -208,6 +250,10 @@ var DB_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "Delete",
 			Handler:    _DB_Delete_Handler,
+		},
+		{
+			MethodName: "Incr",
+			Handler:    _DB_Incr_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},
