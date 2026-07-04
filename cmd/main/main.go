@@ -10,14 +10,19 @@ import (
 	"syscall"
 
 	"github.com/code-lucasgabriel/raft-replicated-db/internal/node"
+	"github.com/code-lucasgabriel/raft-replicated-db/internal/raftnode"
 )
 
 func main() {
 	cfg := node.Config{
-		NodeID:   envOr("NODE_ID", "node-1"),
-		GRPCPort: mustAtoi(envOr("NODE_PORT", "5000")),
-		Peers:    mustParsePeers(envOr("PEERS", "node-1=localhost:5000")),
+		NodeID:    envOr("NODE_ID", "node-1"),
+		GRPCPort:  mustAtoi(envOr("NODE_PORT", "5000")),
+		DataDir:   envOr("DATA_DIR", "/var/lib/raft-db"),
+		Peers:     mustParsePeers(envOr("PEERS", "node-1=node-1:7000")),
+		Bootstrap: envOr("BOOTSTRAP", "false") == "true",
 	}
+	// Local Raft bind address is the entry in PEERS that matches NODE_ID.
+	cfg.BindAddr = peerAddrOrDie(cfg.NodeID, cfg.Peers)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
@@ -31,10 +36,11 @@ func main() {
 	}
 }
 
-// mustParsePeers parses "id1=addr1,id2=addr2,..." into the peer list.
-func mustParsePeers(raw string) []node.Peer {
+// mustParsePeers parses "id1=addr1,id2=addr2,..." into the peer list. The
+// addresses are the Raft TCP transport endpoints, not the client gRPC port.
+func mustParsePeers(raw string) []raftnode.Peer {
 	parts := strings.Split(raw, ",")
-	peers := make([]node.Peer, 0, len(parts))
+	peers := make([]raftnode.Peer, 0, len(parts))
 	for _, p := range parts {
 		p = strings.TrimSpace(p)
 		if p == "" {
@@ -44,12 +50,22 @@ func mustParsePeers(raw string) []node.Peer {
 		if eq <= 0 || eq == len(p)-1 {
 			log.Fatalf("invalid PEERS entry %q (expected id=addr)", p)
 		}
-		peers = append(peers, node.Peer{ID: p[:eq], Addr: p[eq+1:]})
+		peers = append(peers, raftnode.Peer{ID: p[:eq], Addr: p[eq+1:]})
 	}
 	if len(peers) == 0 {
 		log.Fatal("PEERS must contain at least one entry")
 	}
 	return peers
+}
+
+func peerAddrOrDie(id string, peers []raftnode.Peer) string {
+	for _, p := range peers {
+		if p.ID == id {
+			return p.Addr
+		}
+	}
+	log.Fatalf("NODE_ID %q not found in PEERS", id)
+	return ""
 }
 
 func envOr(k, d string) string {

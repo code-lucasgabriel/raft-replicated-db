@@ -1,5 +1,5 @@
-// Package server hosts the client DB API and the internal Raft API on a
-// single gRPC server.
+// Package server hosts the client-facing gRPC DB API. Raft cluster traffic
+// uses a separate TCP transport on a different port — see internal/raftnode.
 package server
 
 import (
@@ -9,7 +9,6 @@ import (
 	"google.golang.org/grpc"
 
 	dbv1 "github.com/code-lucasgabriel/raft-replicated-db/internal/pb/db/v1"
-	raftv1 "github.com/code-lucasgabriel/raft-replicated-db/internal/pb/raft/v1"
 )
 
 type Server struct {
@@ -17,14 +16,13 @@ type Server struct {
 	lis  net.Listener
 }
 
-func New(port int, db *DBService, raft *RaftService) (*Server, error) {
+func New(port int, db *DBService) (*Server, error) {
 	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
 	if err != nil {
 		return nil, fmt.Errorf("listen :%d: %w", port, err)
 	}
 	gs := grpc.NewServer()
 	dbv1.RegisterDBServer(gs, db)
-	raftv1.RegisterRaftServer(gs, raft)
 	return &Server{grpc: gs, lis: lis}, nil
 }
 
