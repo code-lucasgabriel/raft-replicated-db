@@ -176,9 +176,10 @@ func (m *Mutex) HandleRequest(ctx context.Context, theirTime uint64, theirID str
 	deferGrant := m.state == held ||
 		(m.state == wanted && less(m.reqTime, m.id, theirTime, theirID))
 	if !deferGrant {
+		state := m.state
 		m.mu.Unlock()
 		log.Printf("ramutex: %s grants %s immediately (their ts=%d, our state=%s)",
-			m.id, theirID, theirTime, m.state)
+			m.id, theirID, theirTime, state)
 		return nil
 	}
 	ch := make(chan struct{})
